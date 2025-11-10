@@ -1,7 +1,4 @@
-mod parsers;
-mod proxy;
-mod middleware;
-mod types;
+use rust_llm_logger::{middleware, proxy};
 
 use axum::{routing::any, Router};
 use std::sync::Arc;

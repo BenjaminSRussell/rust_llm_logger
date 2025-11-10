@@ -10,10 +10,19 @@ pub struct RequestData {
 }
 
 /// Token usage information
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TokenUsage {
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
+}
+
+impl TokenUsage {
+    pub fn new(prompt_tokens: Option<u32>, completion_tokens: Option<u32>) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+        }
+    }
 }
 
 /// Complete metrics for a single LLM request

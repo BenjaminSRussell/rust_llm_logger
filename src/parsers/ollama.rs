@@ -39,8 +39,12 @@ impl OllamaParser {
 
                 // If this is the final response with the "done" flag, extract token counts
                 if response.done {
-                    self.token_usage.prompt_tokens = response.prompt_eval_count;
-                    self.token_usage.completion_tokens = response.eval_count;
+                    if response.prompt_eval_count.is_some() {
+                        self.token_usage.prompt_tokens = response.prompt_eval_count;
+                    }
+                    if response.eval_count.is_some() {
+                        self.token_usage.completion_tokens = response.eval_count;
+                    }
                 }
             } else {
                 tracing::debug!("Failed to parse Ollama JSON line: {:?}", String::from_utf8_lossy(&line));
@@ -65,8 +69,12 @@ impl BackendStreamParser for OllamaParser {
             // Try to parse the remaining buffer as a final JSON object
             if let Ok(response) = serde_json::from_slice::<OllamaStreamResponse>(&self.buffer) {
                 if response.done {
-                    self.token_usage.prompt_tokens = response.prompt_eval_count;
-                    self.token_usage.completion_tokens = response.eval_count;
+                    if response.prompt_eval_count.is_some() {
+                        self.token_usage.prompt_tokens = response.prompt_eval_count;
+                    }
+                    if response.eval_count.is_some() {
+                        self.token_usage.completion_tokens = response.eval_count;
+                    }
                 }
             }
         }
