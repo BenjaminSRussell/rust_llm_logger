@@ -72,6 +72,12 @@ impl OpenAIParser {
     }
 }
 
+impl Default for OpenAIParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl BackendStreamParser for OpenAIParser {
     async fn feed_chunk(&mut self, chunk: &Bytes) {

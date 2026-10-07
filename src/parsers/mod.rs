@@ -24,8 +24,8 @@ pub trait BackendStreamParser: Send {
 /// Detected backend type based on content-type
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BackendType {
-    Ollama,  // application/x-ndjson
-    OpenAI,  // text/event-stream
+    Ollama, // application/x-ndjson
+    OpenAI, // text/event-stream
     Unknown,
 }
 
