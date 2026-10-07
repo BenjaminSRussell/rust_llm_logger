@@ -1,22 +1,17 @@
-use rust_llm_logger::{middleware, proxy};
+use rust_llm_logger::{app, middleware, pricing::Pricing, store::Store, telemetry::Telemetry};
 
-use axum::{
-    extract::Request,
-    middleware::{from_fn, from_fn_with_state, Next},
-    response::{IntoResponse, Response},
-    routing::any,
-    Router,
-};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::collections::HashSet;
 use std::sync::Arc;
-use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// LLM logging reverse proxy.
 #[derive(Debug, Parser)]
 #[command(name = "rust_llm_logger", about = "LLM request logging proxy")]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Bind address (env: LLM_LOGGER_BIND)
     #[arg(long, env = "LLM_LOGGER_BIND", default_value = "127.0.0.1:3000")]
     bind: String,
@@ -24,6 +19,10 @@ struct Args {
     /// SQLite path for persisted metrics (env: METRICS_DB); empty disables
     #[arg(long, env = "METRICS_DB", default_value = "")]
     metrics_db: String,
+
+    /// JSON file of per-model prices merged over the built-in table (env: LLM_LOGGER_PRICING)
+    #[arg(long, env = "LLM_LOGGER_PRICING", default_value = "")]
+    pricing_file: String,
 
     /// Comma-separated backend ports allowed for /proxy/{port}/...
     /// (env: ALLOWED_BACKEND_PORTS). Default: common local LLM ports.
@@ -48,6 +47,19 @@ struct Args {
     log_filter: String,
 }
 
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Delete persisted calls older than N days (rolled up into daily_rollup by default)
+    Gc {
+        /// Age threshold in days
+        #[arg(long, default_value_t = 30)]
+        days: u32,
+        /// Delete without writing daily aggregates
+        #[arg(long)]
+        no_rollup: bool,
+    },
+}
+
 fn parse_allow_list(raw: &str) -> Result<HashSet<u16>, String> {
     let mut set = HashSet::new();
     for part in raw.split(',') {
@@ -69,17 +81,14 @@ fn parse_allow_list(raw: &str) -> Result<HashSet<u16>, String> {
     Ok(set)
 }
 
+fn fail(msg: impl std::fmt::Display) -> ! {
+    eprintln!("config error: {msg}");
+    std::process::exit(2);
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-
-    let allow = match parse_allow_list(&args.allowed_backend_ports) {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            eprintln!("config error: {e}");
-            std::process::exit(2);
-        }
-    };
 
     tracing_subscriber::registry()
         .with(
@@ -90,65 +99,50 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    if !args.metrics_db.is_empty() {
-        tracing::info!(path = %args.metrics_db, "METRICS_DB configured");
+    if let Some(Command::Gc { days, no_rollup }) = args.command {
+        if args.metrics_db.is_empty() {
+            fail("gc needs --metrics-db / METRICS_DB");
+        }
+        let store = Store::open(&args.metrics_db).unwrap_or_else(|e| fail(e));
+        match store.gc_days(days, !no_rollup) {
+            Ok(r) => {
+                println!(
+                    "gc: deleted {} call(s) older than {days} day(s); {} rollup group(s) updated",
+                    r.deleted, r.rolled_up_groups
+                );
+                return;
+            }
+            Err(e) => fail(e),
+        }
     }
 
+    let allow = Arc::new(parse_allow_list(&args.allowed_backend_ports).unwrap_or_else(|e| fail(e)));
     middleware::set_inject_stream_usage(args.inject_stream_usage);
 
-    let client = Arc::new(create_http_client());
-
-    let app = Router::new()
-        .route("/proxy/:backend_port/*path", any(proxy::proxy_handler))
-        .layer(from_fn(middleware::extract_request_data))
-        .layer(from_fn_with_state(
-            Arc::clone(&allow),
-            allow_port_middleware,
+    let pricing = Pricing::load(Some(&args.pricing_file)).unwrap_or_else(|e| fail(e));
+    let store = if args.metrics_db.is_empty() {
+        None
+    } else {
+        tracing::info!(path = %args.metrics_db, "persisting calls to SQLite");
+        Some(Arc::new(
+            Store::open(&args.metrics_db).unwrap_or_else(|e| fail(e)),
         ))
-        .layer(TraceLayer::new_for_http())
-        .with_state(client);
+    };
+    let telemetry = Arc::new(Telemetry::new(pricing, store));
+
+    let app = app::build_app(Arc::clone(&allow), telemetry);
 
     let listener = tokio::net::TcpListener::bind(&args.bind)
         .await
         .unwrap_or_else(|e| panic!("Failed to bind {}: {e}", args.bind));
 
     tracing::info!(
-        "LLM Logging Proxy listening on {} (allowed ports: {:?})",
+        "LLM Logging Proxy listening on {} (allowed ports: {:?}); dashboard at /, Prometheus at /metrics",
         listener.local_addr().unwrap(),
         allow
     );
 
     axum::serve(listener, app).await.expect("Server failed");
-}
-
-async fn allow_port_middleware(
-    axum::extract::State(allow): axum::extract::State<Arc<HashSet<u16>>>,
-    req: Request,
-    next: Next,
-) -> Response {
-    let path = req.uri().path();
-    if let Some(rest) = path.strip_prefix("/proxy/") {
-        let port_str = rest.split('/').next().unwrap_or("");
-        if let Ok(port) = port_str.parse::<u16>() {
-            if !allow.contains(&port) {
-                return (
-                    axum::http::StatusCode::FORBIDDEN,
-                    format!("backend port {port} not in ALLOWED_BACKEND_PORTS"),
-                )
-                    .into_response();
-            }
-        } else if !port_str.is_empty() {
-            return (axum::http::StatusCode::BAD_REQUEST, "invalid backend port").into_response();
-        }
-    }
-    next.run(req).await
-}
-
-fn create_http_client() -> hyper_util::client::legacy::Client<
-    hyper_util::client::legacy::connect::HttpConnector,
-    axum::body::Body,
-> {
-    hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build_http()
 }
 
 #[cfg(test)]

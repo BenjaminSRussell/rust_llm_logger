@@ -78,7 +78,8 @@ The proxy will start on `http://127.0.0.1:3000` by default.
 | Flag / env | Default | Meaning |
 |---|---|---|
 | `--bind` / `LLM_LOGGER_BIND` | `127.0.0.1:3000` | Listen address (use `0.0.0.0:3001` for Tailscale) |
-| `--metrics-db` / `METRICS_DB` | empty | Optional SQLite path for metrics |
+| `--metrics-db` / `METRICS_DB` | empty | SQLite file; every finished call is written to the `calls` table (empty = in-memory only) |
+| `--pricing-file` / `LLM_LOGGER_PRICING` | empty | JSON price table merged over the built-in defaults |
 | `--allowed-backend-ports` / `ALLOWED_BACKEND_PORTS` | `11434,8080,8000,5000` | Ports permitted under `/proxy/{port}/` |
 | `--inject-stream-usage` / `LLM_LOGGER_INJECT_STREAM_USAGE` | `false` | Add `stream_options.include_usage` to streamed OpenAI-compatible requests |
 | `--log-filter` / `LLM_LOGGER_LOG` | `rust_llm_logger=info,...` | Used when `RUST_LOG` unset |
@@ -127,6 +128,70 @@ curl http://127.0.0.1:3000/proxy/8080/v1/chat/completions \
   }'
 ```
 
+## Observability
+
+### Persistence (#3) and retention (#10)
+
+With `METRICS_DB=/var/lib/llm-logger/calls.db` each completed call becomes one row in
+`calls` (model, tokens, latency, TTFT, outcome, cost, trace id, redacted prompt and
+headers). Inserts run on a blocking thread so the streaming path never waits on disk.
+
+Old rows are pruned with the `gc` subcommand. By default deleted rows are first folded
+into `daily_rollup` (per day/model counts, tokens, cost) so long-term totals survive:
+
+```bash
+METRICS_DB=calls.db rust_llm_logger gc --days 30          # roll up, then delete
+METRICS_DB=calls.db rust_llm_logger gc --days 7 --no-rollup
+# cron: 15 3 * * * METRICS_DB=/var/lib/llm-logger/calls.db /usr/local/bin/rust_llm_logger gc --days 30
+```
+
+### Prometheus (#4)
+
+`GET /metrics` serves the text exposition format:
+
+- `llm_requests_total{model,outcome}` (`ok`, `upstream_error`, `client_abort`)
+- `llm_prompt_tokens_total{model}`, `llm_completion_tokens_total{model}`
+- `llm_estimated_cost_usd_total{model}`
+- `llm_request_latency_ms` and `llm_ttft_ms` histograms
+
+```yaml
+scrape_configs:
+  - job_name: llm-logger
+    static_configs:
+      - targets: ["127.0.0.1:3000"]
+```
+
+### Dashboard (#6)
+
+`GET /` renders the most recent calls (`?model=NAME` filters, `?limit=N`, default 100, max 1000).
+It reads from SQLite when configured, otherwise from an in-memory ring of the last 200
+calls, and shows an empty state before the first request.
+
+### Cost estimation (#7)
+
+Each call gets `estimated_cost_usd = prompt/1000 * prompt_per_1k + completion/1000 * completion_per_1k`.
+Models are matched by longest prefix; unknown models get `null` and a one-time warning.
+Override or extend the built-in table with `--pricing-file`:
+
+```json
+{ "gpt-4o-mini": { "prompt_per_1k": 0.00015, "completion_per_1k": 0.0006 },
+  "llama3":      { "prompt_per_1k": 0.0,     "completion_per_1k": 0.0 } }
+```
+
+### Redaction (#9)
+
+Credential headers (`authorization`, `proxy-authorization`, `cookie`, `set-cookie`,
+`x-api-key`, `api-key`, `openai-api-key`, `anthropic-api-key`, and anything containing `token`/`secret`) are never logged or
+stored. Prompts are scrubbed of bearer tokens and common key shapes (`sk-…`, `AIza…`,
+`hf_…`, `xoxb-…`) and capped at 4000 characters before persistence. Requests are still
+forwarded to the backend unchanged.
+
+### Trace propagation (#11)
+
+An incoming W3C `traceparent` is forwarded upstream as-is; when absent, one is generated.
+The 32-hex trace id is stored with the call and included in the log line, so proxy rows
+can be joined with application traces.
+
 ## Metrics Output
 
 Metrics are logged to stdout in JSON format:
@@ -138,6 +203,8 @@ Metrics are logged to stdout in JSON format:
   "prompt_tokens": 8,
   "completion_tokens": 150,
   "latency_ms": 1243,
+  "estimated_cost_usd": 0.0003,
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
   "timestamp": "2025-11-09T12:34:56.789Z"
 }
 ```
@@ -167,8 +234,16 @@ Use `--bind` / `LLM_LOGGER_BIND` instead of editing source.
 
 ```
 src/
-├── main.rs              # Server initialization and routing
+├── main.rs              # CLI, config, `gc` subcommand
+├── app.rs               # Router (/, /metrics, /proxy) and port allow-list
 ├── proxy.rs             # Core proxy handler and stream-tee logic
+├── telemetry.rs         # Fan-out of finished calls to store / Prometheus / ring
+├── store.rs             # SQLite persistence, rollups, GC
+├── prom.rs              # Prometheus counters and histograms
+├── dashboard.rs         # HTML recent-calls view
+├── pricing.rs           # Cost table and estimation
+├── redact.rs            # Header / prompt secret scrubbing
+├── trace.rs             # W3C traceparent handling
 ├── middleware.rs        # Request body extraction middleware
 ├── types.rs             # Data structures and serialization types
 └── parsers/
@@ -187,12 +262,10 @@ src/
 
 ## Future Enhancements
 
-- [ ] Database persistence (PostgreSQL, ClickHouse)
-- [ ] Prometheus metrics export
+- [ ] Additional persistence backends (PostgreSQL, ClickHouse)
 - [ ] Authentication/API key management
 - [ ] Request/response filtering and transformation
 - [ ] Rate limiting per model/user
-- [ ] Cost estimation based on token counts
 
 ## License
 
