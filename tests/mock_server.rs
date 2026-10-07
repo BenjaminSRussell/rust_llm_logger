@@ -133,8 +133,8 @@ async fn ollama_generate(Json(req): Json<OllamaRequest>) -> Response {
             created_at: chrono::Utc::now().to_rfc3339(),
             response: "".to_string(),
             done: true,
-            prompt_eval_count: Some(5),  // Simulated prompt tokens
-            eval_count: Some(words.len() as u32),  // Simulated completion tokens
+            prompt_eval_count: Some(5), // Simulated prompt tokens
+            eval_count: Some(words.len() as u32), // Simulated completion tokens
         };
 
         let json = serde_json::to_string(&final_chunk).unwrap();
@@ -205,7 +205,7 @@ async fn openai_chat_completions(Json(req): Json<OpenAIRequest>) -> Response {
                 finish_reason: "stop".to_string(),
             }],
             usage: Usage {
-                prompt_tokens: 12,  // Simulated
+                prompt_tokens: 12, // Simulated
                 completion_tokens: words.len() as u32,
                 total_tokens: 12 + words.len() as u32,
             },
@@ -231,8 +231,7 @@ async fn openai_chat_completions(Json(req): Json<OpenAIRequest>) -> Response {
 #[tokio::main]
 async fn main() {
     // Ollama mock server on port 11434
-    let ollama_app = Router::new()
-        .route("/api/generate", post(ollama_generate));
+    let ollama_app = Router::new().route("/api/generate", post(ollama_generate));
 
     tokio::spawn(async {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:11434")
@@ -243,8 +242,7 @@ async fn main() {
     });
 
     // OpenAI-compatible mock server on port 8080
-    let openai_app = Router::new()
-        .route("/v1/chat/completions", post(openai_chat_completions));
+    let openai_app = Router::new().route("/v1/chat/completions", post(openai_chat_completions));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8080")
         .await

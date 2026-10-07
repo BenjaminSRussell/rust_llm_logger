@@ -94,7 +94,10 @@ async fn main() {
     let app = Router::new()
         .route("/proxy/:backend_port/*path", any(proxy::proxy_handler))
         .layer(from_fn(middleware::extract_request_data))
-        .layer(from_fn_with_state(Arc::clone(&allow), allow_port_middleware))
+        .layer(from_fn_with_state(
+            Arc::clone(&allow),
+            allow_port_middleware,
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(client);
 

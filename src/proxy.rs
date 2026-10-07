@@ -15,10 +15,8 @@ use tokio_stream::StreamExt;
 use crate::parsers::{detect_backend_type, BackendStreamParser, BackendType};
 use crate::types::{CallOutcome, LLMMetrics, RequestData};
 
-type HttpClient = hyper_util::client::legacy::Client<
-    hyper_util::client::legacy::connect::HttpConnector,
-    Body,
->;
+type HttpClient =
+    hyper_util::client::legacy::Client<hyper_util::client::legacy::connect::HttpConnector, Body>;
 
 const HOP_BY_HOP: &[&str] = &[
     "connection",
@@ -60,7 +58,11 @@ pub async fn proxy_handler(
     let start_time = tokio::time::Instant::now();
     let request_data = req.extensions().get::<RequestData>().cloned();
 
-    let upstream_uri = format!("http://127.0.0.1:{}/{}", backend_port, path.trim_start_matches('/'));
+    let upstream_uri = format!(
+        "http://127.0.0.1:{}/{}",
+        backend_port,
+        path.trim_start_matches('/')
+    );
     let upstream_uri = if let Some(query) = req.uri().query() {
         format!("{}?{}", upstream_uri, query)
     } else {
@@ -103,7 +105,11 @@ pub async fn proxy_handler(
         .unwrap_or("");
 
     let backend_type = detect_backend_type(content_type);
-    tracing::debug!("Detected backend type: {:?}, content-type: {}", backend_type, content_type);
+    tracing::debug!(
+        "Detected backend type: {:?}, content-type: {}",
+        backend_type,
+        content_type
+    );
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(32);
     let request_data_clone = request_data.clone();
@@ -120,9 +126,7 @@ pub async fn proxy_handler(
     });
 
     let stream = ReceiverStream::new(rx);
-    let body = StreamBody::new(stream.map(|result| {
-        result.map(hyper::body::Frame::data)
-    }));
+    let body = StreamBody::new(stream.map(|result| result.map(hyper::body::Frame::data)));
 
     Response::from_parts(parts, Body::new(body))
 }
@@ -165,10 +169,9 @@ async fn handle_stream_tee(
             Some(Err(e)) => {
                 tracing::error!("Error reading upstream body: {}", e);
                 upstream_stream_error = true;
-                let _ = client_tx.send(Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))).await;
+                let _ = client_tx
+                    .send(Err(std::io::Error::other(e.to_string())))
+                    .await;
                 break;
             }
             None => break,
@@ -227,7 +230,11 @@ async fn handle_stream_tee(
 }
 
 /// Pure helper used by unit tests to classify outcomes.
-pub fn classify_outcome(status: u16, client_aborted: bool, upstream_stream_error: bool) -> CallOutcome {
+pub fn classify_outcome(
+    status: u16,
+    client_aborted: bool,
+    upstream_stream_error: bool,
+) -> CallOutcome {
     if client_aborted {
         CallOutcome::ClientAborted
     } else if upstream_stream_error {
@@ -245,12 +252,18 @@ mod tests {
 
     #[test]
     fn status_500_is_upstream_error() {
-        assert_eq!(classify_outcome(500, false, false), CallOutcome::UpstreamError);
+        assert_eq!(
+            classify_outcome(500, false, false),
+            CallOutcome::UpstreamError
+        );
     }
 
     #[test]
     fn client_abort_wins() {
-        assert_eq!(classify_outcome(200, true, false), CallOutcome::ClientAborted);
+        assert_eq!(
+            classify_outcome(200, true, false),
+            CallOutcome::ClientAborted
+        );
     }
 
     #[test]

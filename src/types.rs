@@ -105,7 +105,10 @@ pub fn content_to_text(content: &Value) -> String {
                 }
                 let obj = p.as_object()?;
                 if obj.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    return obj.get("text").and_then(|t| t.as_str()).map(|s| s.to_string());
+                    return obj
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string());
                 }
                 None
             })

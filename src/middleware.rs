@@ -1,9 +1,4 @@
-use axum::{
-    body::Body,
-    extract::Request,
-    middleware::Next,
-    response::Response,
-};
+use axum::{body::Body, extract::Request, middleware::Next, response::Response};
 use http_body_util::{BodyExt, Limited};
 
 use crate::types::{content_to_text, GenericRequest, RequestData};
@@ -51,7 +46,11 @@ pub fn parse_model_and_prompt(body_bytes: &[u8]) -> (String, String) {
     // Prefer a top-level model even when messages fail to deserialize.
     let model = serde_json::from_slice::<serde_json::Value>(body_bytes)
         .ok()
-        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string()))
+        .and_then(|v| {
+            v.get("model")
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string())
+        })
         .unwrap_or_else(|| "unknown".to_string());
 
     if let Ok(parsed) = serde_json::from_slice::<GenericRequest>(body_bytes) {
@@ -94,7 +93,8 @@ mod tests {
                 ]},
                 {"role": "assistant", "content": null}
             ]
-        })).unwrap();
+        }))
+        .unwrap();
         let (model, prompt) = parse_model_and_prompt(&body);
         assert_eq!(model, "llama3.2");
         assert!(prompt.contains("hello"), "{prompt}");

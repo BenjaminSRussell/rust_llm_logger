@@ -31,7 +31,8 @@ impl OllamaParser {
 
             // Try to parse as JSON
             if let Ok(response) = serde_json::from_slice::<OllamaStreamResponse>(&line) {
-                tracing::debug!("Parsed Ollama response: done={}, prompt_eval_count={:?}, eval_count={:?}",
+                tracing::debug!(
+                    "Parsed Ollama response: done={}, prompt_eval_count={:?}, eval_count={:?}",
                     response.done,
                     response.prompt_eval_count,
                     response.eval_count
@@ -47,9 +48,18 @@ impl OllamaParser {
                     }
                 }
             } else {
-                tracing::debug!("Failed to parse Ollama JSON line: {:?}", String::from_utf8_lossy(&line));
+                tracing::debug!(
+                    "Failed to parse Ollama JSON line: {:?}",
+                    String::from_utf8_lossy(&line)
+                );
             }
         }
+    }
+}
+
+impl Default for OllamaParser {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
