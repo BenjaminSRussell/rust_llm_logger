@@ -58,7 +58,22 @@ cargo build --release
 cargo run --release
 ```
 
-The proxy will start on `http://127.0.0.1:3000`.
+The proxy will start on `http://127.0.0.1:3000` by default.
+
+### Configuration (#5)
+
+| Flag / env | Default | Meaning |
+|---|---|---|
+| `--bind` / `LLM_LOGGER_BIND` | `127.0.0.1:3000` | Listen address (use `0.0.0.0:3001` for Tailscale) |
+| `--metrics-db` / `METRICS_DB` | empty | Optional SQLite path for metrics |
+| `--allowed-backend-ports` / `ALLOWED_BACKEND_PORTS` | `11434,8080,8000,5000` | Ports permitted under `/proxy/{port}/` |
+| `--log-filter` / `LLM_LOGGER_LOG` | `rust_llm_logger=info,...` | Used when `RUST_LOG` unset |
+
+```bash
+LLM_LOGGER_BIND=0.0.0.0:3001 cargo run
+cargo run -- --help
+```
+
 
 ### Usage
 
@@ -132,11 +147,7 @@ RUST_LOG=rust_llm_logger=warn cargo run
 
 ### Server Port
 
-Edit `src/main.rs` to change the listening port (default: 3000):
-
-```rust
-let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
-```
+Use `--bind` / `LLM_LOGGER_BIND` instead of editing source.
 
 ## Project Structure
 
