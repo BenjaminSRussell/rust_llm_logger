@@ -12,11 +12,10 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
+use crate::app::AppState;
 use crate::parsers::{detect_backend, parser_for, BackendStreamParser, BackendType};
-use crate::types::{CallOutcome, LLMMetrics, RequestData};
-
-type HttpClient =
-    hyper_util::client::legacy::Client<hyper_util::client::legacy::connect::HttpConnector, Body>;
+use crate::telemetry::Telemetry;
+use crate::types::{CallOutcome, LLMMetrics, RequestData, TokenUsage};
 
 const HOP_BY_HOP: &[&str] = &[
     "connection",
@@ -51,7 +50,7 @@ fn strip_hop_by_hop(headers: &mut hyper::HeaderMap) {
 
 /// Main proxy handler that routes to different backends
 pub async fn proxy_handler(
-    State(client): State<Arc<HttpClient>>,
+    State(state): State<AppState>,
     Path((backend_port, path)): Path<(u16, String)>,
     req: Request,
 ) -> Response {
@@ -83,10 +82,12 @@ pub async fn proxy_handler(
     parts.uri = uri;
     parts.headers.remove("host");
     strip_hop_by_hop(&mut parts.headers);
+    let trace_id = crate::trace::ensure_traceparent(&mut parts.headers);
+    let safe_headers = crate::redact::safe_headers(&parts.headers);
 
     let upstream_request = hyper::Request::from_parts(parts, body);
 
-    let upstream_response = match client.request(upstream_request).await {
+    let upstream_response = match state.client.request(upstream_request).await {
         Ok(resp) => resp,
         Err(e) => {
             tracing::error!("Failed to proxy request: {}", e);
@@ -113,6 +114,7 @@ pub async fn proxy_handler(
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(32);
     let request_data_clone = request_data.clone();
+    let telemetry = Arc::clone(&state.telemetry);
     tokio::spawn(async move {
         handle_stream_tee(
             body,
@@ -121,6 +123,11 @@ pub async fn proxy_handler(
             request_data_clone,
             start_time,
             status,
+            CallContext {
+                telemetry,
+                trace_id,
+                safe_headers,
+            },
         )
         .await;
     });
@@ -131,6 +138,13 @@ pub async fn proxy_handler(
     Response::from_parts(parts, Body::new(body))
 }
 
+/// Per-call context handed to the tee task for recording.
+struct CallContext {
+    telemetry: Arc<Telemetry>,
+    trace_id: String,
+    safe_headers: Vec<(String, String)>,
+}
+
 /// Handles the stream-tee: forwards chunks to client and parser simultaneously
 async fn handle_stream_tee(
     mut upstream_body: hyper::body::Incoming,
@@ -139,6 +153,7 @@ async fn handle_stream_tee(
     request_data: Option<RequestData>,
     start_time: tokio::time::Instant,
     status: u16,
+    ctx: CallContext,
 ) {
     let mut parser: Box<dyn BackendStreamParser> = parser_for(backend_type);
 
@@ -174,7 +189,9 @@ async fn handle_stream_tee(
         }
     }
 
-    let token_usage = parser.finalize().await;
+    // Close the client stream before recording so the response completes promptly.
+    drop(client_tx);
+    let token_usage: TokenUsage = parser.finalize().await;
     let latency = start_time.elapsed();
 
     let outcome = if client_aborted {
@@ -188,9 +205,13 @@ async fn handle_stream_tee(
     };
 
     if let Some(req_data) = request_data {
+        let estimated_cost_usd = ctx
+            .telemetry
+            .pricing
+            .estimate(&req_data.model, &token_usage);
         let metrics = LLMMetrics {
             model: req_data.model,
-            prompt: req_data.prompt,
+            prompt: Telemetry::sanitize_prompt(&req_data.prompt),
             prompt_tokens: token_usage.prompt_tokens,
             completion_tokens: token_usage.completion_tokens,
             latency_ms: latency.as_millis() as u64,
@@ -198,6 +219,8 @@ async fn handle_stream_tee(
             status,
             outcome: outcome.clone(),
             timestamp: chrono::Utc::now().to_rfc3339(),
+            estimated_cost_usd,
+            trace_id: Some(ctx.trace_id),
         };
 
         let label = match metrics.outcome {
@@ -208,7 +231,7 @@ async fn handle_stream_tee(
         };
 
         tracing::info!(
-            "{}: model={}, status={}, outcome={:?}, prompt_tokens={:?}, completion_tokens={:?}, latency_ms={}, ttft_ms={:?}",
+            "{}: model={}, status={}, outcome={:?}, prompt_tokens={:?}, completion_tokens={:?}, latency_ms={}, ttft_ms={:?}, cost_usd={:?}, trace_id={:?}",
             label,
             metrics.model,
             metrics.status,
@@ -216,12 +239,16 @@ async fn handle_stream_tee(
             metrics.prompt_tokens,
             metrics.completion_tokens,
             metrics.latency_ms,
-            metrics.ttft_ms
+            metrics.ttft_ms,
+            metrics.estimated_cost_usd,
+            metrics.trace_id
         );
 
         if let Ok(json) = serde_json::to_string_pretty(&metrics) {
             tracing::info!("Metrics: {}", json);
         }
+
+        ctx.telemetry.record(&metrics, ctx.safe_headers).await;
     }
 }
 

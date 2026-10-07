@@ -1,4 +1,12 @@
+pub mod app;
+pub mod dashboard;
 pub mod middleware;
 pub mod parsers;
+pub mod pricing;
+pub mod prom;
 pub mod proxy;
+pub mod redact;
+pub mod store;
+pub mod telemetry;
+pub mod trace;
 pub mod types;

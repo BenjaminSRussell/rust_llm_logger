@@ -46,6 +46,10 @@ pub struct LLMMetrics {
     pub status: u16,
     pub outcome: CallOutcome,
     pub timestamp: String,
+    /// USD estimate from the pricing table; null for unknown models (#7)
+    pub estimated_cost_usd: Option<f64>,
+    /// W3C trace id from (or generated for) the `traceparent` header (#11)
+    pub trace_id: Option<String>,
 }
 
 /// Ollama streaming response format
