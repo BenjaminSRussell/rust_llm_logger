@@ -5,6 +5,7 @@ use axum::{
 };
 use bytes::Bytes;
 use http_body_util::{BodyExt, StreamBody};
+use hyper::header::HeaderName;
 use hyper::StatusCode;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -12,12 +13,43 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
 use crate::parsers::{detect_backend_type, BackendStreamParser, BackendType};
-use crate::types::{LLMMetrics, RequestData};
+use crate::types::{CallOutcome, LLMMetrics, RequestData};
 
 type HttpClient = hyper_util::client::legacy::Client<
     hyper_util::client::legacy::connect::HttpConnector,
     Body,
 >;
+
+const HOP_BY_HOP: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+];
+
+fn strip_hop_by_hop(headers: &mut hyper::HeaderMap) {
+    for name in HOP_BY_HOP {
+        headers.remove(*name);
+    }
+    // Also drop any headers named in Connection
+    if let Some(conn) = headers.get(hyper::header::CONNECTION).cloned() {
+        if let Ok(s) = conn.to_str() {
+            for part in s.split(',') {
+                let h = part.trim();
+                if !h.is_empty() {
+                    if let Ok(name) = HeaderName::from_bytes(h.as_bytes()) {
+                        headers.remove(name);
+                    }
+                }
+            }
+        }
+    }
+    headers.remove(hyper::header::CONNECTION);
+}
 
 /// Main proxy handler that routes to different backends
 pub async fn proxy_handler(
@@ -25,16 +57,10 @@ pub async fn proxy_handler(
     Path((backend_port, path)): Path<(u16, String)>,
     req: Request,
 ) -> Response {
-    // Start latency timer
     let start_time = tokio::time::Instant::now();
-
-    // Extract request data from extensions (added by middleware)
     let request_data = req.extensions().get::<RequestData>().cloned();
 
-    // Construct the upstream URI
     let upstream_uri = format!("http://127.0.0.1:{}/{}", backend_port, path.trim_start_matches('/'));
-
-    // Add query string if present
     let upstream_uri = if let Some(query) = req.uri().query() {
         format!("{}?{}", upstream_uri, query)
     } else {
@@ -43,7 +69,6 @@ pub async fn proxy_handler(
 
     tracing::debug!("Proxying request to: {}", upstream_uri);
 
-    // Parse the URI
     let uri = match upstream_uri.parse::<hyper::Uri>() {
         Ok(u) => u,
         Err(e) => {
@@ -52,16 +77,13 @@ pub async fn proxy_handler(
         }
     };
 
-    // Build the upstream request
     let (mut parts, body) = req.into_parts();
     parts.uri = uri;
-
-    // Remove host header to avoid conflicts
     parts.headers.remove("host");
+    strip_hop_by_hop(&mut parts.headers);
 
     let upstream_request = hyper::Request::from_parts(parts, body);
 
-    // Send request to upstream
     let upstream_response = match client.request(upstream_request).await {
         Ok(resp) => resp,
         Err(e) => {
@@ -70,23 +92,20 @@ pub async fn proxy_handler(
         }
     };
 
-    // Extract response parts
-    let (parts, body) = upstream_response.into_parts();
+    let (mut parts, body) = upstream_response.into_parts();
+    let status = parts.status.as_u16();
+    strip_hop_by_hop(&mut parts.headers);
+
     let content_type = parts
         .headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    // Detect backend type from content-type
     let backend_type = detect_backend_type(content_type);
-
     tracing::debug!("Detected backend type: {:?}, content-type: {}", backend_type, content_type);
 
-    // Create the stream-tee architecture
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(32);
-
-    // Spawn task to handle stream inspection
     let request_data_clone = request_data.clone();
     tokio::spawn(async move {
         handle_stream_tee(
@@ -95,17 +114,16 @@ pub async fn proxy_handler(
             backend_type,
             request_data_clone,
             start_time,
+            status,
         )
         .await;
     });
 
-    // Create the response body from the receiver
     let stream = ReceiverStream::new(rx);
     let body = StreamBody::new(stream.map(|result| {
         result.map(hyper::body::Frame::data)
     }));
 
-    // Reconstruct the response
     Response::from_parts(parts, Body::new(body))
 }
 
@@ -116,51 +134,60 @@ async fn handle_stream_tee(
     backend_type: BackendType,
     request_data: Option<RequestData>,
     start_time: tokio::time::Instant,
+    status: u16,
 ) {
-    // Create the appropriate parser
     let mut parser: Box<dyn BackendStreamParser> = match backend_type {
         BackendType::Ollama => Box::new(crate::parsers::OllamaParser::new()),
         BackendType::OpenAI => Box::new(crate::parsers::OpenAIParser::new()),
         BackendType::Unknown => Box::new(crate::parsers::PassthroughParser),
     };
 
-    // Process the stream
+    let mut client_aborted = false;
+    let mut upstream_stream_error = false;
+    let mut ttft_ms: Option<u64> = None;
+
     loop {
         match upstream_body.frame().await {
             Some(Ok(frame)) => {
                 if let Ok(data) = frame.into_data() {
-                    // Feed chunk to parser (non-blocking)
+                    if ttft_ms.is_none() && !data.is_empty() {
+                        ttft_ms = Some(start_time.elapsed().as_millis() as u64);
+                    }
                     parser.feed_chunk(&data).await;
 
-                    // Forward chunk to client
                     if client_tx.send(Ok(data)).await.is_err() {
                         tracing::debug!("Client disconnected");
+                        client_aborted = true;
                         break;
                     }
                 }
             }
             Some(Err(e)) => {
                 tracing::error!("Error reading upstream body: {}", e);
+                upstream_stream_error = true;
                 let _ = client_tx.send(Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     e.to_string(),
                 ))).await;
                 break;
             }
-            None => {
-                // Stream ended normally
-                break;
-            }
+            None => break,
         }
     }
 
-    // Finalize parser and get token usage
     let token_usage = parser.finalize().await;
-
-    // Calculate final latency
     let latency = start_time.elapsed();
 
-    // Log the metrics
+    let outcome = if client_aborted {
+        CallOutcome::ClientAborted
+    } else if upstream_stream_error {
+        CallOutcome::UpstreamStreamError
+    } else if status >= 400 {
+        CallOutcome::UpstreamError
+    } else {
+        CallOutcome::Ok
+    };
+
     if let Some(req_data) = request_data {
         let metrics = LLMMetrics {
             model: req_data.model,
@@ -168,20 +195,66 @@ async fn handle_stream_tee(
             prompt_tokens: token_usage.prompt_tokens,
             completion_tokens: token_usage.completion_tokens,
             latency_ms: latency.as_millis() as u64,
+            ttft_ms,
+            status,
+            outcome: outcome.clone(),
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
 
+        let label = match metrics.outcome {
+            CallOutcome::Ok => "LLM Request Complete",
+            CallOutcome::UpstreamError => "LLM Request Upstream Error",
+            CallOutcome::ClientAborted => "LLM Request Client Aborted",
+            CallOutcome::UpstreamStreamError => "LLM Request Upstream Stream Error",
+        };
+
         tracing::info!(
-            "LLM Request Complete: model={}, prompt_tokens={:?}, completion_tokens={:?}, latency_ms={}",
+            "{}: model={}, status={}, outcome={:?}, prompt_tokens={:?}, completion_tokens={:?}, latency_ms={}, ttft_ms={:?}",
+            label,
             metrics.model,
+            metrics.status,
+            metrics.outcome,
             metrics.prompt_tokens,
             metrics.completion_tokens,
-            metrics.latency_ms
+            metrics.latency_ms,
+            metrics.ttft_ms
         );
 
-        // Here you could write to a database, file, or other logging backend
         if let Ok(json) = serde_json::to_string_pretty(&metrics) {
             tracing::info!("Metrics: {}", json);
         }
+    }
+}
+
+/// Pure helper used by unit tests to classify outcomes.
+pub fn classify_outcome(status: u16, client_aborted: bool, upstream_stream_error: bool) -> CallOutcome {
+    if client_aborted {
+        CallOutcome::ClientAborted
+    } else if upstream_stream_error {
+        CallOutcome::UpstreamStreamError
+    } else if status >= 400 {
+        CallOutcome::UpstreamError
+    } else {
+        CallOutcome::Ok
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_500_is_upstream_error() {
+        assert_eq!(classify_outcome(500, false, false), CallOutcome::UpstreamError);
+    }
+
+    #[test]
+    fn client_abort_wins() {
+        assert_eq!(classify_outcome(200, true, false), CallOutcome::ClientAborted);
+    }
+
+    #[test]
+    fn ok_on_2xx() {
+        assert_eq!(classify_outcome(200, false, false), CallOutcome::Ok);
     }
 }

@@ -1,12 +1,11 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Data extracted from the request body
 #[derive(Clone, Debug)]
 pub struct RequestData {
     pub model: String,
     pub prompt: String,
-    #[allow(dead_code)]
-    pub raw_body: bytes::Bytes,
 }
 
 /// Token usage information
@@ -25,6 +24,16 @@ impl TokenUsage {
     }
 }
 
+/// How a proxied call finished
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CallOutcome {
+    Ok,
+    UpstreamError,
+    ClientAborted,
+    UpstreamStreamError,
+}
+
 /// Complete metrics for a single LLM request
 #[derive(Clone, Debug, Serialize)]
 pub struct LLMMetrics {
@@ -33,6 +42,9 @@ pub struct LLMMetrics {
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
     pub latency_ms: u64,
+    pub ttft_ms: Option<u64>,
+    pub status: u16,
+    pub outcome: CallOutcome,
     pub timestamp: String,
 }
 
@@ -73,6 +85,32 @@ pub struct GenericRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct Message {
+    #[serde(default)]
     pub role: String,
-    pub content: String,
+    /// OpenAI allows string, array of parts, or null (tool-call assistants).
+    #[serde(default)]
+    pub content: Value,
+}
+
+/// Pull human-readable text out of a message content Value.
+pub fn content_to_text(content: &Value) -> String {
+    match content {
+        Value::Null => String::new(),
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| {
+                if let Some(s) = p.as_str() {
+                    return Some(s.to_string());
+                }
+                let obj = p.as_object()?;
+                if obj.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    return obj.get("text").and_then(|t| t.as_str()).map(|s| s.to_string());
+                }
+                None
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        other => other.to_string(),
+    }
 }
