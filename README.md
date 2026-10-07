@@ -8,6 +8,8 @@ A high-performance, non-buffering reverse proxy for LLM servers built with Rust,
 - **Multi-Backend Support**:
   - Ollama (NDJSON format)
   - OpenAI-compatible APIs (SSE/Server-Sent Events) - vLLM, llama.cpp, etc.
+  - Anthropic Messages API (SSE `message_start` / `message_delta` usage)
+  - Non-streaming `application/json` responses from any of the above
 - **Dynamic Routing**: Route to different backend ports on the fly
 - **Non-Blocking**: Client receives streaming responses without waiting for parsing or logging
 - **Comprehensive Metrics**: Captures model name, prompt, token counts (input/output), and end-to-end latency
@@ -43,6 +45,17 @@ The core innovation is the stream-tee architecture implemented in `src/proxy.rs:
 - Parses SSE (Server-Sent Events) format
 - Looks for final `usage` object containing `prompt_tokens` and `completion_tokens`
 - Ignores intermediate delta chunks
+- OpenAI only sends streamed usage when the request has `stream_options.include_usage=true`; run with `--inject-stream-usage` to add it automatically
+
+#### Anthropic Parser (`src/parsers/anthropic.rs`)
+- Used for `text/event-stream` responses on `/v1/messages`
+- `input_tokens` from `message_start`, cumulative `output_tokens` from `message_delta`
+
+#### JSON Parser (`src/parsers/json.rs`)
+- Used for non-streaming `application/json` (OpenAI `stream:false`, Anthropic, Ollama `stream:false`)
+- Tries OpenAI `usage.*_tokens`, Anthropic `usage.input/output_tokens`, then Ollama `done` + `*eval_count`
+
+SSE framing (`src/parsers/sse.rs`) splits on raw bytes, so multi-byte UTF-8 split across chunks is safe. It accepts `\n\n`, `\r\n\r\n` and `\r\r` delimiters and `data:` with or without a space.
 
 ## Quick Start
 
@@ -67,6 +80,7 @@ The proxy will start on `http://127.0.0.1:3000` by default.
 | `--bind` / `LLM_LOGGER_BIND` | `127.0.0.1:3000` | Listen address (use `0.0.0.0:3001` for Tailscale) |
 | `--metrics-db` / `METRICS_DB` | empty | Optional SQLite path for metrics |
 | `--allowed-backend-ports` / `ALLOWED_BACKEND_PORTS` | `11434,8080,8000,5000` | Ports permitted under `/proxy/{port}/` |
+| `--inject-stream-usage` / `LLM_LOGGER_INJECT_STREAM_USAGE` | `false` | Add `stream_options.include_usage` to streamed OpenAI-compatible requests |
 | `--log-filter` / `LLM_LOGGER_LOG` | `rust_llm_logger=info,...` | Used when `RUST_LOG` unset |
 
 ```bash
