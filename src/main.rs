@@ -34,6 +34,11 @@ struct Args {
     )]
     allowed_backend_ports: String,
 
+    /// Add `stream_options.include_usage=true` to streamed OpenAI-compatible requests
+    /// that omit it, so token usage is reported (env: LLM_LOGGER_INJECT_STREAM_USAGE)
+    #[arg(long, env = "LLM_LOGGER_INJECT_STREAM_USAGE", default_value_t = false)]
+    inject_stream_usage: bool,
+
     /// Log filter when RUST_LOG is unset
     #[arg(
         long,
@@ -88,6 +93,8 @@ async fn main() {
     if !args.metrics_db.is_empty() {
         tracing::info!(path = %args.metrics_db, "METRICS_DB configured");
     }
+
+    middleware::set_inject_stream_usage(args.inject_stream_usage);
 
     let client = Arc::new(create_http_client());
 

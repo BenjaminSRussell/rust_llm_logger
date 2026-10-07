@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
-use crate::parsers::{detect_backend_type, BackendStreamParser, BackendType};
+use crate::parsers::{detect_backend, parser_for, BackendStreamParser, BackendType};
 use crate::types::{CallOutcome, LLMMetrics, RequestData};
 
 type HttpClient =
@@ -104,7 +104,7 @@ pub async fn proxy_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let backend_type = detect_backend_type(content_type);
+    let backend_type = detect_backend(content_type, &format!("/{}", path.trim_start_matches('/')));
     tracing::debug!(
         "Detected backend type: {:?}, content-type: {}",
         backend_type,
@@ -140,11 +140,7 @@ async fn handle_stream_tee(
     start_time: tokio::time::Instant,
     status: u16,
 ) {
-    let mut parser: Box<dyn BackendStreamParser> = match backend_type {
-        BackendType::Ollama => Box::new(crate::parsers::OllamaParser::new()),
-        BackendType::OpenAI => Box::new(crate::parsers::OpenAIParser::new()),
-        BackendType::Unknown => Box::new(crate::parsers::PassthroughParser),
-    };
+    let mut parser: Box<dyn BackendStreamParser> = parser_for(backend_type);
 
     let mut client_aborted = false;
     let mut upstream_stream_error = false;

@@ -1,7 +1,13 @@
+mod anthropic;
+mod json;
 mod ollama;
 mod openai;
 mod passthrough;
+pub mod sse;
+pub mod usage;
 
+pub use anthropic::AnthropicParser;
+pub use json::JsonResponseParser;
 pub use ollama::OllamaParser;
 pub use openai::OpenAIParser;
 pub use passthrough::PassthroughParser;
@@ -21,21 +27,51 @@ pub trait BackendStreamParser: Send {
     async fn finalize(self: Box<Self>) -> TokenUsage;
 }
 
-/// Detected backend type based on content-type
+/// Detected response format
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BackendType {
-    Ollama, // application/x-ndjson
-    OpenAI, // text/event-stream
+    /// `application/x-ndjson` (Ollama streaming)
+    Ollama,
+    /// `text/event-stream` from an OpenAI-compatible server
+    OpenAI,
+    /// `text/event-stream` from the Anthropic Messages API
+    Anthropic,
+    /// Non-streaming `application/json` (OpenAI, Anthropic or Ollama)
+    Json,
     Unknown,
 }
 
-/// Detect backend type from content-type header
+/// Detect the response format from the content type alone.
 pub fn detect_backend_type(content_type: &str) -> BackendType {
-    if content_type.contains("application/x-ndjson") || content_type.contains("application/json") {
+    detect_backend(content_type, "")
+}
+
+/// Detect the response format from the content type plus the request path
+/// (`/v1/messages` is Anthropic's streaming endpoint).
+pub fn detect_backend(content_type: &str, request_path: &str) -> BackendType {
+    let ct = content_type.to_ascii_lowercase();
+    if ct.contains("application/x-ndjson") {
         BackendType::Ollama
-    } else if content_type.contains("text/event-stream") {
-        BackendType::OpenAI
+    } else if ct.contains("text/event-stream") {
+        if request_path.trim_end_matches('/').ends_with("/v1/messages") {
+            BackendType::Anthropic
+        } else {
+            BackendType::OpenAI
+        }
+    } else if ct.contains("application/json") {
+        BackendType::Json
     } else {
         BackendType::Unknown
+    }
+}
+
+/// Build the parser for a detected format.
+pub fn parser_for(backend: BackendType) -> Box<dyn BackendStreamParser> {
+    match backend {
+        BackendType::Ollama => Box::new(OllamaParser::new()),
+        BackendType::OpenAI => Box::new(OpenAIParser::new()),
+        BackendType::Anthropic => Box::new(AnthropicParser::new()),
+        BackendType::Json => Box::new(JsonResponseParser::new()),
+        BackendType::Unknown => Box::new(PassthroughParser),
     }
 }
